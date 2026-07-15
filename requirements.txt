@@ -1,0 +1,78 @@
+# Core OpenTelemetry
+opentelemetry-api==1.22.0
+opentelemetry-sdk==1.22.0
+opentelemetry-exporter-otlp==1.22.0
+opentelemetry-exporter-otlp-proto-grpc==1.22.0
+opentelemetry-exporter-otlp-proto-http==1.22.0
+opentelemetry-instrument==1.22.0
+opentelemetry-instrumentation==1.22.0
+opentelemetry-propagator==1.22.0
+opentelemetry-semantic-conventions==1.22.0
+
+# Auto-instrumentation
+opentelemetry-instrumentation-fastapi==0.42b0
+opentelemetry-instrumentation-requests==0.42b0
+opentelemetry-instrumentation-httpx==0.42b0
+opentelemetry-instrumentation-psycopg2==0.42b0
+opentelemetry-instrumentation-sqlalchemy==0.42b0
+opentelemetry-instrumentation-redis==0.42b0
+opentelemetry-instrumentation-celery==0.42b0
+opentelemetry-instrumentation-logging==0.42b0
+
+# LangChain / LlamaIndex
+opentelemetry-instrumentation-langchain==0.42b0
+opentelemetry-instrumentation-llamaindex==0.42b0
+
+# Web framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.2
+pydantic-settings==2.1.0
+
+# HTTP client
+httpx==0.25.2
+aiohttp==3.9.1
+
+# Database
+psycopg2-binary==2.9.9
+redis==5.0.1
+
+# Vector DB clients
+qdrant-client==1.8.1
+chromadb==0.4.22
+pinecone-client==3.1.0
+
+# AI/ML
+langchain==0.1.0
+langchain-openai==0.0.5
+langchain-anthropic==0.1.0
+langchain-google-genai==0.0.6
+llama-index==0.9.0
+llama-index-vector-stores-qdrant==0.1.0
+llama-index-vector-stores-chroma==0.1.0
+
+# OpenAI / Anthropic / Google
+openai==1.12.0
+anthropic==0.18.0
+google-generativeai==0.3.2
+
+# Utilities
+python-dotenv==1.0.0
+pyyaml==6.0.1
+tenacity==8.2.3
+structlog==24.1.0
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-mock==3.12.0
+pytest-cov==4.1.0
+
+# Load testing
+locust==2.17.0
+
+# Development
+black==23.12.0
+ruff==0.1.14
+mypy==1.7.1
+pre-commit==3.6.0

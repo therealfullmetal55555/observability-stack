@@ -1,0 +1,185 @@
+# Local observability stack.
+#
+#   make up      start everything
+#   make logs    follow
+#   make down    stop (volumes survive)
+#
+# Agents on the host send OTLP to localhost:4317. Agents in containers join the
+# `observability` network and use otel-collector:4317.
+
+name: observability
+
+services:
+  otel-collector:
+    # Stock contrib image by default so `make up` works without a Go toolchain.
+    # Switch to `make up-custom` to build the tokencost processor in.
+    image: otel/opentelemetry-collector-contrib:0.106.1
+    container_name: obs-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"     # OTLP gRPC — agents point here
+      - "4318:4318"     # OTLP HTTP — for browser/edge clients
+      - "8888:8888"     # collector's own metrics
+      - "13133:13133"   # health check
+    environment:
+      - GOMEMLIMIT=400MiB
+    depends_on:
+      tempo:
+        condition: service_started
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+    restart: unless-stopped
+    networks: [observability]
+
+  tempo:
+    image: grafana/tempo:2.5.0
+    container_name: obs-tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"     # query UI / Grafana datasource
+    restart: unless-stopped
+    networks: [observability]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: obs-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle          # make reload-prometheus works because of this
+      - --web.enable-admin-api
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/rules/ai-agents.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks: [observability]
+
+  loki:
+    image: grafana/loki:2.9.1
+    container_name: obs-loki
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/var/loki
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+    networks: [observability]
+
+  promtail:
+    image: grafana/promtail:2.9.1
+    container_name: obs-promtail
+    command: ["-config.file=/etc/promtail/config.yml"]
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/config.yml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    restart: unless-stopped
+    networks: [observability]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: obs-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""            # plugins slow cold start; enable deliberately
+      GF_ALERTING_ENABLED: "true"
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      ALERT_EMAIL_TO: ${ALERT_EMAIL_TO:-}
+      PAGERDUTY_KEY: ${PAGERDUTY_KEY:-}
+    volumes:
+      # One provisioning tree. Dashboards mount read-only from the repo so
+      # `make dashboards-export` can pull UI edits back into the same files.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    restart: unless-stopped
+    networks: [observability]
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: obs-alertmanager
+    command:
+      - --config.file=/etc/alertmanager/config.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/config.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "9093:9093"
+    restart: unless-stopped
+    networks: [observability]
+
+  # Host metrics so a slow agent can be distinguished from a slow box.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: obs-node-exporter
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|var/lib/docker/.+)($$|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+    networks: [observability]
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: obs-blackbox
+    command: ["--config.file=/etc/blackbox_exporter/config.yml"]
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    ports:
+      - "9115:9115"
+    restart: unless-stopped
+    networks: [observability]
+
+volumes:
+  tempo-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:
+  alertmanager-data:
+
+networks:
+  observability:
+    driver: bridge
+
+  # Built with otel-collector/builder-config.yaml, which adds the tokencost
+  # processor. Same config file, same ports — just a different binary.
+  otel-collector-custom:
+    profiles: [custom]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.collector
+    container_name: obs-collector-custom
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "14317:4317"
+      - "14318:4318"
+    restart: unless-stopped
+    networks: [observability]

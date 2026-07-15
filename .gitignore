@@ -1,0 +1,38 @@
+# secrets
+.env
+.env.local
+*.pem
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# node
+node_modules/
+npm-debug.log*
+instrumentation/n8n/dist/
+
+# editor / os
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# data volumes (never commit metrics or traces)
+data/
+*.tsdb
+/prometheus/data/
+/tempo/data/
+/loki/data/
