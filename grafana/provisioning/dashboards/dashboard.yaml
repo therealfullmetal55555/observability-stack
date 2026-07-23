@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: 'AI Agent Observability Dashboards'
+    orgId: 1
+    folder: 'AI Agent Observability'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

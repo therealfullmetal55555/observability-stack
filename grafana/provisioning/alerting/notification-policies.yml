@@ -1,0 +1,57 @@
+# Routing tree.
+#
+# Order matters: the first matching child wins, so cost alerts are matched
+# before the generic critical branch. A $5k bill is not a pager event — it's a
+# Slack message to the person who owns the budget.
+
+apiVersion: 1
+
+policies:
+  - orgId: 1
+    receiver: slack-agents
+    group_by: ['alertname', 'service_name']
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+    routes:
+      - receiver: slack-cost
+        object_matchers:
+          - ['alertname', '=~', '.*Cost.*|.*Budget.*|LLMCostHigh']
+        group_by: ['model', 'service_name']
+        group_wait: 1m
+        repeat_interval: 12h
+        mute_time_intervals: []
+
+      - receiver: pagerduty-critical
+        object_matchers:
+          - ['severity', '=', 'critical']
+        group_wait: 10s
+        group_interval: 2m
+        repeat_interval: 1h
+        continue: true
+
+      - receiver: email-oncall
+        object_matchers:
+          - ['severity', '=', 'critical']
+        group_wait: 1m
+        repeat_interval: 4h
+
+muteTimes:
+  # Weekend nights off for anything that isn't a page. The agents keep running;
+  # the on-call human gets to sleep.
+  - orgId: 1
+    name: weekends
+    time_intervals:
+      - times:
+          - start_time: '00:00'
+            end_time: '24:00'
+        weekdays: ['saturday', 'sunday']
+        location: 'Europe/Moscow'
+
+  - orgId: 1
+    name: off-hours
+    time_intervals:
+      - times:
+          - start_time: '22:00'
+            end_time: '08:00'
+        location: 'Europe/Moscow'

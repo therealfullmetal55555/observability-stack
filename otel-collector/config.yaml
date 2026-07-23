@@ -1,0 +1,209 @@
+# Collector config for 21 agents on one box.
+#
+# The split of responsibility is deliberate: agents emit raw token counts and
+# raw citation markers, the collector turns them into the numbers the dashboards
+# read. That way a provider price change or a new grading rule is one edit here,
+# not a redeploy of every agent repo.
+#
+# `tokencost` is the only custom component — see otel-collector/processor/tokencost/.
+# Everything else is stock contrib.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 16
+      http:
+        endpoint: 0.0.0.0:4318
+    limits:
+      # A runaway agent can send a 100 MB payload of stacked tool outputs.
+      # Cap it rather than let the collector OOM and take every agent down.
+      max_request_body_size: 4MiB
+
+  # Collector's own metrics + anything else scrapeable on localhost.
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: otel-collector
+          scrape_interval: 15s
+          static_configs:
+            - targets: ['localhost:8888']
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  resourcedetection:
+    detectors: [env, system, docker]
+    timeout: 5s
+    override: false
+
+  # ---- standard hygiene ----------------------------------------------------
+
+  batch:
+    timeout: 5s
+    send_batch_size: 500
+    send_batch_max_size: 1000
+
+  # Fill in what agents forget. Cheap, and it makes trace search usable.
+  transform/agent_defaults:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["gen_ai.tool.status"], "success") where attributes["gen_ai.tool.name"] != nil and attributes["gen_ai.tool.status"] == nil
+          - set(attributes["gen_ai.response.has_citations"], false) where attributes["gen_ai.response.citations"] == nil and attributes["gen_ai.response.has_citations"] == nil
+          - set(attributes["deployment.environment"], "unknown") where attributes["deployment.environment"] == nil
+
+  # Cost is recomputed centrally so a price change doesn't need 21 redeploys.
+  tokencost:
+    models:
+      gpt-4o: { input_usd_per_1m: 2.50, output_usd_per_1m: 10.00 }
+      gpt-4o-mini: { input_usd_per_1m: 0.15, output_usd_per_1m: 0.60 }
+      gpt-4.1: { input_usd_per_1m: 2.00, output_usd_per_1m: 8.00 }
+      gpt-4.1-mini: { input_usd_per_1m: 0.40, output_usd_per_1m: 1.60 }
+      o3-mini: { input_usd_per_1m: 1.10, output_usd_per_1m: 4.40 }
+      claude-sonnet-4: { input_usd_per_1m: 3.00, output_usd_per_1m: 15.00 }
+      claude-haiku-3.5: { input_usd_per_1m: 0.80, output_usd_per_1m: 4.00 }
+      gemini-2.5-flash: { input_usd_per_1m: 0.30, output_usd_per_1m: 2.50 }
+      gemini-2.5-pro: { input_usd_per_1m: 1.25, output_usd_per_1m: 10.00 }
+      llama-3.3-70b: { input_usd_per_1m: 0.60, output_usd_per_1m: 0.70 }
+      # Local inference. Zero, but not unknown — the dashboard needs to tell
+      # "we didn't track this model" apart from "this model is free".
+      ollama: { input_usd_per_1m: 0, output_usd_per_1m: 0 }
+    input_tokens_attr: gen_ai.usage.input_tokens
+    output_tokens_attr: gen_ai.usage.output_tokens
+    model_attr: gen_ai.request.model
+    cost_attr: gen_ai.response.cost_usd
+    total_tokens_attr: gen_ai.usage.total_tokens
+    # Leave an explicit cost from the SDK alone — it usually knows about
+    # batch discounts and cache reads that our table doesn't.
+    respect_existing: true
+    unknown_model: warn  # warn | zero | drop_span
+
+  # Anything with a citation marker counts as cited; writes the boolean the
+  # hallucination dashboard groups by.
+  transform/citations:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          - set(attributes["gen_ai.response.has_citations"], true) where IsMatch(attributes["gen_ai.response.citations"], "\\S")
+
+  tail_sampling:
+    decision_wait: 30s
+    num_traces: 50000
+    expected_new_traces_per_sec: 1000
+    # Multiple policies are OR'd: a trace is kept if any matches. Order doesn't
+    # matter, inclusion does.
+    policies:
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: slow-traces
+        type: latency
+        latency:
+          threshold_ms: 10000
+      - name: expensive
+        type: numeric_attribute
+        numeric_attribute:
+          key: gen_ai.response.cost_usd
+          min_value: 0.25
+      - name: uncited-answers
+        type: boolean_attribute
+        boolean_attribute:
+          key: gen_ai.response.has_citations
+          value: false
+      - name: baseline
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 10
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 2000
+
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    resource_to_telemetry_conversion:
+      enabled: true
+    retry_on_failure:
+      enabled: true
+
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+    default_labels_enabled:
+      exporter: false
+      job: true
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 120s
+
+  # Drop-in safety valve. Set loglevel to warn before shipping to prod, or this
+  # becomes the noisiest thing in your logs.
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  pprof:
+    endpoint: 127.0.0.1:1777
+  zpages:
+    endpoint: 127.0.0.1:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - resourcedetection
+        - transform/agent_defaults
+        - tokencost
+        - transform/citations
+        - tail_sampling
+        - batch
+      exporters: [otlp/tempo, debug]
+
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [prometheusremotewrite]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [loki]
+
+  telemetry:
+    logs:
+      level: warn
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888
+
+  # Metrics the collector can't observe from outside: queue depth, dropped
+  # spans, export failures. These are the leading indicators of a broken pipeline.
+  #
+  #   otelcol_exporter_send_failed_spans_total
+  #   otelcol_exporter_queue_size
+  #   otelcol_processor_dropped_spans_total

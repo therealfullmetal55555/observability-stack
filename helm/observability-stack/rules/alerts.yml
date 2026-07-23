@@ -1,0 +1,173 @@
+groups:
+  - name: ai-agent-alerts
+    interval: 30s
+    rules:
+      # Agent-level alerts
+      - alert: AgentDown
+        expr: |
+          absent(gen_ai_agent_up{job="ai-agents"}) or
+          (time() - gen_ai_agent_last_heartbeat_timestamp_seconds) > 60
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Agent {{ $labels.service_name }} is down"
+          description: "Agent {{ $labels.service_name }} has not reported a heartbeat for > 60s"
+
+      - alert: AgentHighErrorRate
+        expr: |
+          sum(rate(gen_ai_agent_calls_total{status="error"}[5m])) by (service_name)
+          /
+          rate(gen_ai_agent_calls_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate for {{ $labels.service_name }}"
+          description: "Agent {{ $labels.service_name }} has {{ $value | humanizePercentage }} error rate over 5m"
+
+      - alert: AgentHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(gen_ai_agent_latency_seconds_bucket[5m])) by (le, service_name)
+          ) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency for {{ $labels.service_name }}"
+          description: "P99 latency is {{ $value | humanizeDuration }} for {{ $labels.service_name }}"
+
+      # Tool call alerts
+      - alert: ToolHighErrorRate
+        expr: |
+          sum(rate(gen_ai_tool_calls_total{status="error"}[5m])) by (tool_name, service_name)
+          /
+          rate(gen_ai_tool_calls_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High tool error rate for {{ $labels.tool_name }}"
+          description: "Tool {{ $labels.tool_name }} on {{ $labels.service_name }} has {{ $value | humanizePercentage }} error rate"
+
+      - alert: ToolHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(gen_ai_tool_call_duration_seconds_bucket[5m])) by (le, tool_name, service_name)
+          ) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High tool latency for {{ $labels.tool_name }}"
+          description: "Tool {{ $labels.tool_name }} on {{ $labels.service_name }} has P99 latency of {{ $value | humanizeDuration }}"
+
+      - alert: ToolHighCost
+        expr: |
+          sum(rate(gen_ai_tool_cost_usd_total[5m])) by (tool_name, service_name) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High cost tool: {{ $labels.tool_name }}"
+          description: "Tool {{ $labels.tool_name }} is costing ${{ $value | humanize }}/sec on {{ $labels.service_name }}"
+
+      # LLM-specific alerts
+      - alert: LLMLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(gen_ai_llm_latency_seconds_bucket[5m])) by (le, model, service_name)
+          ) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High LLM latency for {{ $labels.model }}"
+          description: "Model {{ $labels.model }} on {{ $labels.service_name }} has P99 latency of {{ $value | humanizeDuration }}"
+
+      - alert: LLMHighErrorRate
+        expr: |
+          sum(rate(gen_ai_llm_calls_total{status="error"}[5m])) by (model, service_name)
+          /
+          rate(gen_ai_llm_calls_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High LLM error rate for {{ $labels.model }}"
+          description: "Model {{ $labels.model }} on {{ $labels.service_name }} has {{ $value | humanizePercentage }} error rate"
+
+      - alert: LLMCostHigh
+        expr: |
+          sum(rate(gen_ai_llm_cost_usd_total[5m])) by (model, service_name) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High LLM cost for {{ $labels.model }}"
+          description: "Model {{ $labels.model }} on {{ $labels.service_name }} is costing ${{ $value | humanize }}/sec"
+
+      # Vector DB alerts
+      - alert: VectorDBHighLatency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(vector_db_query_duration_seconds_bucket[5m])) by (le, operation)
+          ) > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High vector DB latency"
+          description: "Vector DB {{ $labels.operation }} has P99 latency of {{ $value | humanizeDuration }}"
+
+      - alert: VectorDBHighErrorRate
+        expr: |
+          sum(rate(vector_db_operations_total{status="error"}[5m])) by (operation)
+          /
+          rate(vector_db_operations_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High vector DB error rate"
+          description: "Vector DB {{ $labels.operation }} has {{ $value | humanizePercentage }} error rate"
+
+      # System alerts
+      - alert: CollectorDown
+        expr: up{job="otel-collector"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OTel Collector is down"
+          description: "Collector {{ $labels.instance }} is not responding — traces, metrics and logs from every agent are being dropped"
+          description: "OpenTelemetry Collector has been down for > 1 minute"
+
+      - alert: CollectorHighMemory
+        expr: |
+          process_resident_memory_bytes{job="otel-collector"} / 1024 / 1024 > 1024
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTel Collector high memory usage"
+          description: "OTel Collector using {{ $value }} MB memory"
+
+      - alert: PrometheusDown
+        expr: up{job="prometheus"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus is down"
+          description: "Prometheus {{ $labels.instance }} has been unreachable for > 1 minute — no metrics are being scraped"
+
+      - alert: GrafanaDown
+        expr: up{job="grafana"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Grafana is down"
+          description: "Grafana {{ $labels.instance }} has been unreachable for > 1 minute — dashboards are offline"

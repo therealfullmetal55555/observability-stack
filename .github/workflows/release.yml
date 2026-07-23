@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  verify:
+    name: verify the tag matches the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
+          chart=$(grep -m1 '^version' helm/observability-stack/Chart.yaml | awk '{print $2}')
+          echo "tag=$tag package=$pkg chart=$chart"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag v$tag does not match pyproject version $pkg"
+            exit 1
+          fi
+          if [ "$tag" != "$chart" ]; then
+            echo "::error::tag v$tag does not match Chart.yaml version $chart"
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  image:
+    name: publish custom collector
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.collector
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/otelcol-ai:v${{ needs.verify.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/otelcol-ai:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  package:
+    name: attach the tarball and chart
+    needs: [verify, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.15.3
+
+      - name: Build the deployable tarball
+        run: bash scripts/package.sh
+
+      - name: Package the chart
+        run: helm package helm/observability-stack --destination dist
+
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ needs.verify.outputs.version }}
+          generate_release_notes: true
+          draft: true
+          body: |
+            ## What's in it
+
+            - `observability-stack-${{ needs.verify.outputs.version }}.tar.gz` — the whole stack. Unpack, `cp .env.example .env`, `make up`.
+            - `observability-stack-${{ needs.verify.outputs.version }}.tgz` — the Helm chart.
+            - `otelcol-ai:v${{ needs.verify.outputs.version }}` — the collector image with the `tokencost` processor built in.
+
+            ## Upgrading
+
+            Check the diff between this release's `filelist.txt` and the previous one before you
+            overwrite a config you've edited. `prometheus/alerts.yml` and the dashboards are the
+            two that people customise.
+
+            ## Verify
+
+            ```bash
+            sha256sum -c SHA256SUMS
+            ```
+          files: |
+            dist/*.tar.gz
+            dist/*.tgz
+            dist/SHA256SUMS
+            dist/*.filelist.txt
+
+  pypi:
+    name: publish the instrumentation package
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build
+      - run: python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Trusted publishing — configure it on PyPI, then delete this line.
+          # password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true

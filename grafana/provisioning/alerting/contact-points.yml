@@ -1,0 +1,63 @@
+# Grafana contact points.
+#
+# Alert *rules* live in prometheus/alerts.yml — one source of truth so the two
+# systems can't drift. Grafana owns delivery: it's the place where an on-call
+# engineer can mute a noisy rule at 2am without a deploy.
+#
+# Secrets come from the environment; see .env.example.
+
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: slack-agents
+    receivers:
+      - uid: slack-agents-default
+        type: slack
+        settings:
+          url: $__env{SLACK_WEBHOOK_URL}
+          recipient: '#alerts'
+          title: |
+            {{ if eq .Status "firing" }}🔥{{ else }}✅{{ end }} {{ .CommonLabels.alertname }}
+          text: |
+            {{ range .Alerts -}}
+            *{{ .Labels.severity | toUpper }}* — {{ .Annotations.summary }}
+            {{ .Annotations.description }}
+            {{ if .Labels.service_name }}service: `{{ .Labels.service_name }}`{{ end }}
+            {{ if .Labels.tool_name }}tool: `{{ .Labels.tool_name }}`{{ end }}
+            {{ if .Labels.model }}model: `{{ .Labels.model }}`{{ end }}
+            {{ end }}
+          disableResolveMessage: false
+
+  - orgId: 1
+    name: slack-cost
+    receivers:
+      - uid: slack-cost-default
+        type: slack
+        settings:
+          url: $__env{SLACK_WEBHOOK_URL}
+          recipient: '#llm-cost'
+          title: '💸 {{ .CommonLabels.alertname }}'
+          text: |
+            {{ range .Alerts }}{{ .Annotations.summary }}
+            {{ .Annotations.description }}{{ end }}
+
+  - orgId: 1
+    name: email-oncall
+    receivers:
+      - uid: email-oncall-default
+        type: email
+        settings:
+          addresses: $__env{ALERT_EMAIL_TO}
+          singleEmail: false
+          subject: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+
+  - orgId: 1
+    name: pagerduty-critical
+    receivers:
+      - uid: pagerduty-critical-default
+        type: pagerduty
+        settings:
+          integrationKey: $__env{PAGERDUTY_KEY}
+          severity: critical
+          summary: '{{ .CommonLabels.alertname }}: {{ .CommonAnnotations.summary }}'
