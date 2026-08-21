@@ -1,0 +1,146 @@
+{{- $fullname := include "observability.fullname" . -}}
+{{- if .Values.dashboards.create }}
+{{/*
+  Dashboards are read straight off disk with .Files.Get, so the chart can never
+  ship a stale copy. If you change grafana/dashboards/*.json, run
+  `helm upgrade` and Grafana restarts with the new version (the pod template has
+  a checksum annotation on this ConfigMap).
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-grafana-dashboards
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "grafana") | nindent 4 }}
+data:
+  agent-overview.json: |
+{{ .Files.Get "dashboards/agent-overview.json" | indent 4 }}
+  token-economics.json: |
+{{ .Files.Get "dashboards/token-economics.json" | indent 4 }}
+  tool-calls.json: |
+{{ .Files.Get "dashboards/tool-calls.json" | indent 4 }}
+  hallucination-guard.json: |
+{{ .Files.Get "dashboards/hallucination-guard.json" | indent 4 }}
+  executive-summary.json: |
+{{ .Files.Get "dashboards/executive-summary.json" | indent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-grafana-provisioning
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "grafana") | nindent 4 }}
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        access: proxy
+        url: {{ include "observability.prometheus.endpoint" . }}
+        isDefault: true
+        editable: false
+        jsonData:
+          timeInterval: 15s
+          httpMethod: POST
+      - name: Tempo
+        type: tempo
+        uid: tempo
+        access: proxy
+        url: http://{{ $fullname }}-tempo:3200
+        editable: false
+        jsonData:
+          httpMethod: GET
+          tracesToLogs:
+            datasourceUid: loki
+            spanStartTimeShift: -1h
+            spanEndTimeShift: 1h
+            tags: ['service.name', 'service.namespace']
+            filterByTraceID: true
+      - name: Loki
+        type: loki
+        uid: loki
+        access: proxy
+        url: {{ include "observability.loki.endpoint" . }}
+        editable: false
+        jsonData:
+          derivedFields:
+            - name: traceID
+              matcherRegex: "trace_id=(\\w+)"
+              url: '$${__value.raw}'
+              urlDisplayLabel: Trace
+              internal:
+                datasourceUid: tempo
+                serviceNameKey: service.name
+                traceIdKey: trace_id
+
+  dashboard-provider.yaml: |
+    apiVersion: 1
+    providers:
+      - name: {{ .Values.dashboards.folder | quote }}
+        orgId: 1
+        folder: {{ .Values.dashboards.folder | quote }}
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        allowUiUpdates: true
+        options:
+          path: /var/lib/grafana/dashboards
+
+  # Alert rules are evaluated by Prometheus (see prometheus/alerts.yml) — Grafana
+  # only handles delivery, so a human can mute a noisy rule without a deploy.
+  contact-points.yaml: |
+    apiVersion: 1
+    contactPoints:
+      - orgId: 1
+        name: slack-agents
+        receivers:
+          - uid: slack-agents-default
+            type: slack
+            settings:
+              url: $${SLACK_WEBHOOK_URL}
+              recipient: '#alerts'
+              title: '{{`{{ if eq .Status "firing" }}🔥{{ else }}✅{{ end }} {{ .CommonLabels.alertname }}`}}'
+              text: '{{`{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}`}}'
+      - orgId: 1
+        name: slack-cost
+        receivers:
+          - uid: slack-cost-default
+            type: slack
+            settings:
+              url: $${SLACK_WEBHOOK_URL}
+              recipient: '#llm-cost'
+      - orgId: 1
+        name: pagerduty-critical
+        receivers:
+          - uid: pagerduty-critical-default
+            type: pagerduty
+            settings:
+              integrationKey: $${PAGERDUTY_KEY}
+              severity: critical
+
+  notification-policies.yaml: |
+    apiVersion: 1
+    policies:
+      - orgId: 1
+        receiver: slack-agents
+        group_by: ['alertname', 'service_name']
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+        routes:
+          - receiver: slack-cost
+            object_matchers:
+              - ['alertname', '=~', '.*Cost.*|.*Budget.*|LLMCostHigh']
+            group_by: ['model', 'service_name']
+            repeat_interval: 12h
+          - receiver: pagerduty-critical
+            object_matchers:
+              - ['severity', '=', 'critical']
+            group_wait: 10s
+            repeat_interval: 1h
+            continue: true
+{{- end }}

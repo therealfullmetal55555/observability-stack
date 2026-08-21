@@ -1,0 +1,143 @@
+{{- $fullname := include "observability.fullname" . -}}
+{{- $component := "collector" -}}
+apiVersion: apps/v1
+kind: {{ if eq .Values.collector.mode "gateway" }}StatefulSet{{ else }}Deployment{{ end }}
+metadata:
+  name: {{ $fullname }}-collector
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  replicas: {{ .Values.collector.replicaCount }}
+  serviceName: {{ if eq .Values.collector.mode "gateway" }}{{ $fullname }}-collector{{ end }}
+  selector:
+    matchLabels:
+      {{- include "observability.selectorLabels" (dict "ctx" . "component" $component) | nindent 6 }}
+  {{- if eq .Values.collector.mode "deployment" }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "observability.selectorLabels" (dict "ctx" . "component" $component) | nindent 8 }}
+      annotations:
+        # Restart on config change. Without this hash, an edited pipeline keeps
+        # running the old one until someone notices missing data.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-collector.yaml") . | sha256sum }}
+        {{- with .Values.collector.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ $fullname }}-collector
+      securityContext:
+        {{- toYaml .Values.collector.podSecurityContext | nindent 8 }}
+      {{- if .Values.collector.affinity }}
+      affinity:
+        {{- toYaml .Values.collector.affinity | nindent 8 }}
+      {{- end }}
+      {{- with .Values.collector.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.collector.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: collector
+          image: "{{ .Values.collector.image.repository }}:{{ .Values.collector.image.tag }}"
+          imagePullPolicy: {{ .Values.collector.image.pullPolicy }}
+          args: ["--config=/etc/otelcol/config.yaml"]
+          securityContext:
+            {{- toYaml .Values.collector.securityContext | nindent 12 }}
+          ports:
+            - { name: otlp-grpc, containerPort: {{ .Values.collector.service.grpcPort }} }
+            - { name: otlp-http, containerPort: {{ .Values.collector.service.httpPort }} }
+            - { name: metrics,   containerPort: {{ .Values.collector.service.metricsPort }} }
+            - { name: health,    containerPort: {{ .Values.collector.service.healthPort }} }
+          env:
+            - name: GOMEMLIMIT
+              value: "{{ mul .Values.collector.config.memoryLimiter.limitMib 2 }}MiB"
+            - name: MY_POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/otelcol, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+          livenessProbe:
+            httpGet: { path: /, port: health }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /, port: health }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.collector.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $fullname }}-collector
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-collector
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  type: {{ .Values.collector.service.type }}
+  ports:
+    - { name: otlp-grpc, port: {{ .Values.collector.service.grpcPort }}, targetPort: otlp-grpc }
+    - { name: otlp-http, port: {{ .Values.collector.service.httpPort }}, targetPort: otlp-http }
+    - { name: metrics,   port: {{ .Values.collector.service.metricsPort }}, targetPort: metrics }
+    - { name: health,    port: {{ .Values.collector.service.healthPort }}, targetPort: health }
+  selector:
+    {{- include "observability.selectorLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $fullname }}-collector
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+{{- if .Values.collector.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-collector
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.collector.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "observability.selectorLabels" (dict "ctx" . "component" $component) | nindent 6 }}
+{{- end }}
+---
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $fullname }}-collector
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" $component) | nindent 4 }}
+    {{- with .Values.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "observability.selectorLabels" (dict "ctx" . "component" $component) | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      path: /metrics
+{{- end }}

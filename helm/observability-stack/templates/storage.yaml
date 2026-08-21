@@ -1,0 +1,237 @@
+{{- $fullname := include "observability.fullname" . -}}
+
+{{- if .Values.tempo.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-tempo
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "tempo") | nindent 4 }}
+data:
+  tempo.yaml: |
+    server:
+      http_listen_port: 3200
+      grpc_listen_port: 9095
+      log_level: {{ if eq .Values.collector.mode "gateway" }}warn{{ else }}info{{ end }}
+
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc: { endpoint: 0.0.0.0:4317 }
+            http: { endpoint: 0.0.0.0:4318 }
+
+    ingester:
+      trace_idle_period: 30s
+      max_block_duration: 5m
+
+    compactor:
+      compaction:
+        block_retention: {{ .Values.tempo.retention }}
+        compacted_block_retention: 1h
+
+    storage:
+      trace:
+        backend: local
+        wal: { path: /var/tempo/wal }
+        local: { path: /var/tempo/blocks }
+
+    # Traces are the first thing that hurts at scale. These caps turn a
+    # misbehaving agent into a dropped trace rather than a full disk.
+    limits:
+      ingestion_rate_limit: 50000
+      ingestion_burst_size: 20000
+      max_bytes_per_trace: 5_000_000
+      max_search_bytes_per_trace: 5_000_000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}-tempo
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "tempo") | nindent 4 }}
+spec:
+  serviceName: {{ $fullname }}-tempo
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "observability.selectorLabels" (dict "ctx" . "component" "tempo") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "observability.selectorLabels" (dict "ctx" . "component" "tempo") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/storage.yaml") . | sha256sum }}
+    spec:
+      securityContext: { runAsUser: 10001, runAsNonRoot: true, fsGroup: 10001 }
+      {{- with .Values.tempo.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tempo.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: tempo
+          image: "{{ .Values.tempo.image.repository }}:{{ .Values.tempo.image.tag }}"
+          args: ["-config.file=/etc/tempo.yaml"]
+          ports:
+            - { name: http, containerPort: 3200 }
+            - { name: grpc, containerPort: 9095 }
+            - { name: otlp-grpc, containerPort: 4317 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/tempo.yaml, subPath: tempo.yaml, readOnly: true }
+            - { name: data, mountPath: /var/tempo }
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            initialDelaySeconds: 20
+          resources:
+            {{- toYaml .Values.tempo.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap: { name: {{ $fullname }}-tempo }
+        {{- if not .Values.tempo.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.tempo.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- include "observability.storageClass" .Values.tempo.persistence | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.tempo.persistence.size }}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-tempo
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "tempo") | nindent 4 }}
+spec:
+  ports:
+    - { name: http, port: 3200, targetPort: http }
+    - { name: grpc, port: 9095, targetPort: grpc }
+    - { name: otlp-grpc, port: 4317, targetPort: otlp-grpc }
+  selector:
+    {{- include "observability.selectorLabels" (dict "ctx" . "component" "tempo") | nindent 4 }}
+{{- end }}
+
+{{- if .Values.prometheus.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-prometheus
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "prometheus") | nindent 4 }}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cluster: {{ .Release.Name }}
+        environment: {{ .Release.Namespace }}
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets: ['{{ $fullname }}-alertmanager:9093']
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+      - job_name: prometheus
+        static_configs: [{ targets: ['localhost:9090'] }]
+      - job_name: otel-collector
+        scrape_interval: 10s
+        static_configs:
+          - targets: ['{{ $fullname }}-collector:{{ .Values.collector.service.metricsPort }}']
+      - job_name: otel-collector-self
+        scrape_interval: 15s
+        static_configs:
+          - targets: ['{{ $fullname }}-collector:{{ .Values.collector.service.metricsPort }}']
+      - job_name: tempo
+        static_configs: [{ targets: ['{{ $fullname }}-tempo:3200'] }]
+      - job_name: loki
+        static_configs: [{ targets: ['{{ $fullname }}-loki:3100'] }]
+      # Agents expose /metrics on a Prometheus client endpoint. Pods carrying
+      # the annotations below are discovered automatically:
+      #   prometheus.io/scrape: "true"
+      #   prometheus.io/port: "8000"
+      - job_name: agents
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: service_name
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+      {{- with .Values.prometheus.extraScrapeConfigs }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+{{- end }}
+
+{{- if .Values.loki.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-loki
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "loki") | nindent 4 }}
+data:
+  loki.yaml: |
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+      grpc_listen_port: 9096
+    common:
+      path_prefix: /var/loki
+      replication_factor: 1
+      ring: { instance_addr: 127.0.0.1, kvstore: { store: inmemory } }
+      storage:
+        filesystem:
+          chunks_directory: /var/loki/chunks
+          rules_directory: /var/loki/rules
+    schema_config:
+      configs:
+        - from: 2024-01-01
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index: { prefix: index_, period: 24h }
+    compactor:
+      working_directory: /var/loki/compactor
+      retention_enabled: true
+      delete_request_store: filesystem
+    limits_config:
+      retention_period: {{ .Values.loki.retention }}
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+      max_query_series: 5000
+      ingestion_rate_mb: 32
+      ingestion_burst_size_mb: 64
+{{- end }}

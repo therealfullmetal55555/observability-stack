@@ -1,0 +1,109 @@
+# Production overrides.
+#
+#   helm upgrade --install observability . -n observability --create-namespace \
+#     -f values-production.yaml --set grafana.alerting.existingSecret=grafana-alerts
+
+collector:
+  # Two replicas behind a load-balanced service. A single collector is a single
+  # point of failure for every signal in the fleet.
+  mode: gateway
+  replicaCount: 2
+
+  customBinary: true
+  image:
+    repository: registry.example.com/otelcol-ai
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests: { cpu: 500m, memory: 512Mi }
+    limits:   { cpu: "2",  memory: 2Gi }
+
+  config:
+    memoryLimiter:
+      limitMib: 1536           # below the 2Gi container limit, on purpose
+      spikeLimitMib: 384
+    tailSampling:
+      decisionWait: 15s        # shorter: faster traces to Tempo after an incident
+      numTraces: 200000        # roughly 5x expected_new_traces_per_sec * decision_wait
+      expectedNewTracesPerSec: 5000
+    debugExporter: false
+
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: collector
+
+tempo:
+  persistence:
+    size: 200Gi
+    storageClass: fast-ssd
+  retention: 336h              # 14 days — you will want last week during an incident
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: "4",  memory: 4Gi }
+
+prometheus:
+  persistence:
+    size: 100Gi
+    storageClass: fast-ssd
+  retention: 90d
+  resources:
+    requests: { cpu: "1",  memory: 2Gi }
+    limits:   { cpu: "4",  memory: 8Gi }
+
+loki:
+  persistence:
+    size: 50Gi
+    storageClass: ""
+  retention: 720h              # 30 days
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits:   { cpu: "2",  memory: 2Gi }
+
+grafana:
+  replicas: 2
+  admin:
+    existingSecret: grafana-admin
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: "1",  memory: 1Gi }
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt
+      nginx.ingress.kubernetes.io/auth-type: basic
+    hosts:
+      - host: grafana.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: grafana-tls
+        hosts: [grafana.example.com]
+  alerting:
+    enabled: true
+    existingSecret: grafana-alerts   # keys: slack-webhook-url, smtp-password, pagerduty-key
+
+alertmanager:
+  enabled: true
+  persistence:
+    size: 5Gi
+  config:
+    existingSecret: alertmanager-secrets
+
+serviceMonitor:
+  enabled: true                 # requires the Prometheus Operator
+  interval: 15s
+  additionalLabels:
+    release: kube-prometheus-stack

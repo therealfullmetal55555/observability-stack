@@ -1,0 +1,195 @@
+{{- $fullname := include "observability.fullname" . -}}
+
+{{/*
+  The alert rules ship with the chart as a verbatim copy of
+  prometheus/alerts.yml. Two copies exist in this repo on purpose: the file is
+  the source of truth for docker-compose and for the repo's own tests, and this
+  template embeds it so the chart works when installed from a registry with no
+  repository beside it. `make helm-diff` checks they agree.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-prometheus-rules
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "prometheus") | nindent 4 }}
+data:
+  ai-agents.yml: |
+{{ .Files.Get "rules/alerts.yml" | indent 4 }}
+
+{{- if .Values.alertmanager.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-alertmanager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "alertmanager") | nindent 4 }}
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+
+    route:
+      # Group by alertname so one broken dependency producing five alerts is one
+      # notification, not five.
+      group_by: ['alertname', 'service_name']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: default
+      routes:
+        - match: { severity: critical }
+          receiver: critical
+          continue: true
+        - match: { severity: warning }
+          receiver: warnings
+        - match_re: { alertname: ".*(Cost|Budget).*" }
+          receiver: cost
+          group_wait: 1m
+          repeat_interval: 12h
+
+    receivers:
+      - name: default
+        {{- if .Values.alertmanager.config.slackWebhook }}
+        slack_configs:
+          - api_url: '{{ .Values.alertmanager.config.slackWebhook }}'
+            channel: '#alerts'
+            send_resolved: true
+            title: '[{{`{{ .Status }}`}}] {{`{{ .GroupLabels.alertname }}`}}'
+            text: '{{`{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}`}}'
+        {{- end }}
+      - name: critical
+        {{- if .Values.alertmanager.config.slackWebhook }}
+        slack_configs:
+          - api_url: '{{ .Values.alertmanager.config.slackWebhook }}'
+            channel: '#critical-alerts'
+            send_resolved: true
+            title: '[CRITICAL] {{`{{ .GroupLabels.alertname }}`}}'
+            text: '{{`{{ range .Alerts }}{{ .Annotations.summary }}\n{{ .Annotations.description }}{{ end }}`}}'
+        {{- end }}
+        {{- if .Values.alertmanager.config.emailTo }}
+        email_configs:
+          - to: '{{ .Values.alertmanager.config.emailTo }}'
+            send_resolved: true
+        {{- end }}
+        {{- if .Values.alertmanager.config.pagerdutyKey }}
+        pagerduty_configs:
+          - service_key: '{{ .Values.alertmanager.config.pagerdutyKey }}'
+            severity: critical
+        {{- end }}
+      - name: warnings
+        {{- if .Values.alertmanager.config.slackWebhook }}
+        slack_configs:
+          - api_url: '{{ .Values.alertmanager.config.slackWebhook }}'
+            channel: '#warnings'
+            send_resolved: true
+        {{- end }}
+      - name: cost
+        {{- if .Values.alertmanager.config.slackWebhook }}
+        slack_configs:
+          - api_url: '{{ .Values.alertmanager.config.slackWebhook }}'
+            channel: '#llm-cost'
+            send_resolved: true
+        {{- end }}
+
+    # A critical alert already covers its warning sibling — don't send both.
+    inhibit_rules:
+      - source_match: { severity: critical }
+        target_match: { severity: warning }
+        equal: ['alertname', 'service_name']
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}-alertmanager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "alertmanager") | nindent 4 }}
+spec:
+  serviceName: {{ $fullname }}-alertmanager
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "observability.selectorLabels" (dict "ctx" . "component" "alertmanager") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "observability.selectorLabels" (dict "ctx" . "component" "alertmanager") | nindent 8 }}
+    spec:
+      securityContext: { runAsUser: 65534, runAsNonRoot: true, fsGroup: 65534 }
+      containers:
+        - name: alertmanager
+          image: "{{ .Values.alertmanager.image.repository }}:{{ .Values.alertmanager.image.tag }}"
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+            - --web.external-url=http://{{ $fullname }}-alertmanager:9093
+          ports: [{ name: http, containerPort: 9093 }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/alertmanager, readOnly: true }
+            - { name: data, mountPath: /alertmanager }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+          resources:
+            {{- toYaml .Values.alertmanager.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap: { name: {{ $fullname }}-alertmanager }
+  {{- if .Values.alertmanager.persistence.enabled }}
+        {{- if not .Values.alertmanager.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- include "observability.storageClass" .Values.alertmanager.persistence | nindent 8 }}
+        resources: { requests: { storage: {{ .Values.alertmanager.persistence.size }} } }
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-alertmanager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "alertmanager") | nindent 4 }}
+spec:
+  ports: [{ name: http, port: 9093, targetPort: http }]
+  selector:
+    {{- include "observability.selectorLabels" (dict "ctx" . "component" "alertmanager") | nindent 4 }}
+{{- end }}
+
+{{- if not .Values.grafana.admin.existingSecret }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $fullname }}-grafana-admin
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "grafana") | nindent 4 }}
+type: Opaque
+stringData:
+  admin-password: {{ .Values.grafana.admin.password | quote }}
+{{- end }}
+
+{{- if and .Values.grafana.alerting.enabled (not .Values.grafana.alerting.existingSecret) }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $fullname }}-alerting
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "grafana") | nindent 4 }}
+type: Opaque
+stringData:
+  slack-webhook-url: {{ .Values.grafana.alerting.slackWebhook | quote }}
+  smtp-password: ""
+  pagerduty-key: {{ .Values.grafana.alerting.pagerdutyKey | quote }}
+{{- end }}

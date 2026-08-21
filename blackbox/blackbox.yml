@@ -1,0 +1,54 @@
+modules:
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      valid_http_versions: ["HTTP/1.1", "HTTP/2"]
+      valid_status_codes: [200]
+      method: GET
+      no_follow_redirects: false
+      fail_if_ssl: false
+      max_redirects: 5
+      headers:
+        User-Agent: "Observability-Blackbox/1.0"
+
+  http_2xx_secure:
+    prober: http
+    timeout: 10s
+    http:
+      valid_http_versions: ["HTTP/1.1", "HTTP/2"]
+      valid_status_codes: [200]
+      method: GET
+      tls_config:
+        insecure_skip_verify: true
+      headers:
+        User-Agent: "Observability-Blackbox/1.0"
+
+  http_post_2xx:
+    prober: http
+    timeout: 10s
+    http:
+      valid_http_versions: ["HTTP/1.1", "HTTP/2"]
+      method: POST
+      headers:
+        Content-Type: "application/json"
+        User-Agent: "Observability-Blackbox/1.0"
+      body: '{"test": true}'
+
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+
+  tcp_connect_tls:
+    prober: tcp
+    timeout: 5s
+    tls: true
+    tls_config:
+      insecure_skip_verify: true
+
+  icmp:
+    prober: icmp
+    timeout: 5s
+    icmp:
+      preferred_ip_protocol: "ip4"
+      payload_size: 32

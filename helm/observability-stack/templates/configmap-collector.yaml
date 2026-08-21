@@ -1,0 +1,198 @@
+{{- if .Values.collector.enabled | default true }}
+{{/*
+  The collector config is generated rather than mounted from the repo so the
+  chart is self-contained: `helm install` from an OCI registry has no repository
+  beside it to read otel-collector/config.yaml from.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "observability.fullname" . }}-collector
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "observability.componentLabels" (dict "ctx" . "component" "collector") | nindent 4 }}
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:{{ .Values.collector.service.grpcPort }}
+            max_recv_msg_size_mib: 16
+          http:
+            endpoint: 0.0.0.0:{{ .Values.collector.service.httpPort }}
+        limits:
+          max_request_body_size: 4MiB
+
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: otel-collector
+              scrape_interval: 15s
+              static_configs:
+                - targets: ['localhost:{{ .Values.collector.service.metricsPort }}']
+
+    processors:
+      memory_limiter:
+        check_interval: {{ .Values.collector.config.memoryLimiter.checkInterval }}
+        limit_mib: {{ .Values.collector.config.memoryLimiter.limitMib }}
+        spike_limit_mib: {{ .Values.collector.config.memoryLimiter.spikeLimitMib }}
+
+      resourcedetection:
+        detectors: [env, system, k8snode]
+        timeout: 5s
+        override: false
+
+      batch:
+        timeout: 5s
+        send_batch_size: 500
+        send_batch_max_size: 1000
+
+      # Fill in what agents forget — cheap, and it makes trace search usable.
+      transform/agent_defaults:
+        error_mode: ignore
+        trace_statements:
+          - context: span
+            statements:
+              - set(attributes["gen_ai.tool.status"], "success") where attributes["gen_ai.tool.name"] != nil and attributes["gen_ai.tool.status"] == nil
+              - set(attributes["gen_ai.response.has_citations"], false) where attributes["gen_ai.response.citations"] == nil and attributes["gen_ai.response.has_citations"] == nil
+
+      transform/citations:
+        error_mode: ignore
+        trace_statements:
+          - context: span
+            statements:
+              - set(attributes["gen_ai.response.has_citations"], true) where IsMatch(attributes["gen_ai.response.citations"], "\\S")
+      {{- if .Values.collector.customBinary }}
+
+      # Only present in the custom build (docker/Dockerfile.collector). Turn on
+      # collector.customBinary when you deploy that image.
+      tokencost:
+        models:
+          gpt-4o: { input_usd_per_1m: 2.50, output_usd_per_1m: 10.00 }
+          gpt-4o-mini: { input_usd_per_1m: 0.15, output_usd_per_1m: 0.60 }
+          gpt-4.1: { input_usd_per_1m: 2.00, output_usd_per_1m: 8.00 }
+          gpt-4.1-mini: { input_usd_per_1m: 0.40, output_usd_per_1m: 1.60 }
+          o3-mini: { input_usd_per_1m: 1.10, output_usd_per_1m: 4.40 }
+          claude-sonnet-4: { input_usd_per_1m: 3.00, output_usd_per_1m: 15.00 }
+          claude-haiku-3.5: { input_usd_per_1m: 0.80, output_usd_per_1m: 4.00 }
+          gemini-2.5-flash: { input_usd_per_1m: 0.30, output_usd_per_1m: 2.50 }
+          gemini-2.5-pro: { input_usd_per_1m: 1.25, output_usd_per_1m: 10.00 }
+          llama-3.3-70b: { input_usd_per_1m: 0.60, output_usd_per_1m: 0.70 }
+          ollama: { input_usd_per_1m: 0, output_usd_per_1m: 0 }
+        model_attr: gen_ai.request.model
+        input_tokens_attr: gen_ai.usage.input_tokens
+        output_tokens_attr: gen_ai.usage.output_tokens
+        cost_attr: gen_ai.response.cost_usd
+        total_tokens_attr: gen_ai.usage.total_tokens
+        respect_existing: true
+        unknown_model: warn
+        emit_metrics: true
+      {{- end }}
+
+      # Errors, slow runs, expensive calls and answers with no citations are
+      # always kept. Everything else is sampled — a 10% baseline still gives the
+      # dashboards enough shape without storing every tool call.
+      tail_sampling:
+        decision_wait: {{ .Values.collector.config.tailSampling.decisionWait }}
+        num_traces: {{ .Values.collector.config.tailSampling.numTraces }}
+        expected_new_traces_per_sec: {{ .Values.collector.config.tailSampling.expectedNewTracesPerSec }}
+        policies:
+          - name: errors
+            type: status_code
+            status_code:
+              status_codes: [ERROR]
+          - name: slow-traces
+            type: latency
+            latency:
+              threshold_ms: 10000
+          - name: expensive
+            type: numeric_attribute
+            numeric_attribute:
+              key: gen_ai.response.cost_usd
+              min_value: 0.25
+          - name: uncited-answers
+            type: boolean_attribute
+            boolean_attribute:
+              key: gen_ai.response.has_citations
+              value: false
+          - name: baseline
+            type: probabilistic
+            probabilistic:
+              sampling_percentage: 10
+
+    exporters:
+      otlp/tempo:
+        endpoint: {{ include "observability.fullname" . }}-tempo:4317
+        tls:
+          insecure: true
+        retry_on_failure:
+          enabled: true
+          max_elapsed_time: 300s
+        sending_queue:
+          enabled: true
+          num_consumers: 4
+          queue_size: 2000
+
+      prometheusremotewrite:
+        endpoint: {{ include "observability.prometheus.endpoint" . }}/api/v1/write
+        resource_to_telemetry_conversion:
+          enabled: true
+        retry_on_failure:
+          enabled: true
+
+      loki:
+        endpoint: {{ include "observability.loki.endpoint" . }}/loki/api/v1/push
+        default_labels_enabled:
+          exporter: false
+          job: true
+        retry_on_failure:
+          enabled: true
+      {{- if .Values.collector.config.debugExporter }}
+
+      debug:
+        verbosity: basic
+        sampling_initial: 5
+        sampling_thereafter: 200
+      {{- end }}
+
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:{{ .Values.collector.service.healthPort }}
+      pprof:
+        endpoint: 127.0.0.1:1777
+      zpages:
+        endpoint: 127.0.0.1:55679
+
+    service:
+      extensions: [health_check, pprof, zpages]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors:
+            - memory_limiter
+            - resourcedetection
+            - transform/agent_defaults
+            {{- if .Values.collector.customBinary }}
+            - tokencost
+            {{- end }}
+            - transform/citations
+            - tail_sampling
+            - batch
+          exporters: [otlp/tempo{{- if .Values.collector.config.debugExporter }}, debug{{- end }}]
+        metrics:
+          receivers: [otlp, prometheus]
+          processors: [memory_limiter, resourcedetection, batch]
+          exporters: [prometheusremotewrite]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resourcedetection, batch]
+          exporters: [loki]
+
+      telemetry:
+        logs:
+          level: {{ if eq .Values.collector.mode "gateway" }}warn{{ else }}info{{ end }}
+        metrics:
+          level: detailed
+          address: 0.0.0.0:{{ .Values.collector.service.metricsPort }}
+{{- end }}

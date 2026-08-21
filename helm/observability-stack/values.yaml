@@ -1,0 +1,224 @@
+# Defaults are sized for a single-node cluster running the whole stack on
+# ~2 CPU / 4 GiB. Override per environment with values-production.yaml.
+#
+#   helm install observability . -n observability --create-namespace
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Applied to every resource. Set to {} if you use cluster-wide defaults.
+global:
+  labels: {}
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Collector
+# ---------------------------------------------------------------------------
+collector:
+  # "deployment" handles a few hundred spans/sec. Switch to "gateway" (a
+  # StatefulSet with its own load-balanced service) past that.
+  mode: deployment
+  replicaCount: 1
+
+  image:
+    repository: otel/opentelemetry-collector-contrib
+    tag: "0.106.1"
+    pullPolicy: IfNotPresent
+  # Set to use the custom build with the tokencost processor:
+  #   docker build -f docker/Dockerfile.collector -t registry/otelcol-ai:1.0.0 .
+  #   --set collector.image.repository=registry/otelcol-ai
+  customBinary: false
+
+  # OTLP endpoints agents send to.
+  service:
+    type: ClusterIP
+    grpcPort: 4317
+    httpPort: 4318
+    metricsPort: 8888
+    healthPort: 13133
+
+  resources:
+    requests: { cpu: 200m, memory: 256Mi }
+    limits:   { cpu: "1",  memory: 768Mi }
+
+  # Raise limit_mib above the container limit or the memory_limiter will never
+  # trip before the OOM killer does, which is the worst of both worlds.
+  config:
+    memoryLimiter:
+      checkInterval: 1s
+      limitMib: 512
+      spikeLimitMib: 128
+    tailSampling:
+      decisionWait: 30s
+      numTraces: 50000
+      expectedNewTracesPerSec: 1000
+    # Agents outnumber everything else here; drop noisy debug exporters in prod.
+    debugExporter: true
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    fsGroup: 10001
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities: { drop: ["ALL"] }
+
+# ---------------------------------------------------------------------------
+# Tempo — traces
+# ---------------------------------------------------------------------------
+tempo:
+  enabled: true
+  image:
+    repository: grafana/tempo
+    tag: "2.5.0"
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+  retention: 168h        # 7 days
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: "1",  memory: 1Gi }
+  nodeSelector: {}
+  tolerations: {}
+
+# ---------------------------------------------------------------------------
+# Prometheus — metrics
+# ---------------------------------------------------------------------------
+prometheus:
+  enabled: true
+  image:
+    repository: prom/prometheus
+    tag: "v2.54.1"
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+  retention: 30d
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: "2",  memory: 2Gi }
+
+  # Agents to scrape. In-cluster services by default; add external targets here.
+  extraScrapeConfigs: []
+  #  - job_name: agents-external
+  #    static_configs: [{ targets: ["10.0.1.10:8000"] }]
+
+  nodeSelector: {}
+  tolerations: {}
+
+# ---------------------------------------------------------------------------
+# Loki — logs
+# ---------------------------------------------------------------------------
+loki:
+  enabled: true
+  image:
+    repository: grafana/loki
+    tag: "2.9.1"
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""
+  retention: 168h
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: "1",  memory: 1Gi }
+  nodeSelector: {}
+  tolerations: {}
+
+# ---------------------------------------------------------------------------
+# Grafana
+# ---------------------------------------------------------------------------
+grafana:
+  enabled: true
+  image:
+    repository: grafana/grafana
+    tag: "11.1.0"
+  replicas: 1
+
+  admin:
+    existingSecret: ""          # recommended: create the secret yourself
+    user: admin
+    password: changeme          # ignored when existingSecret is set
+
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: ""
+
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: grafana.local
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+  # Alert delivery only — rules live in prometheus/alerts.yml.
+  alerting:
+    enabled: true
+    slackWebhook: ""
+    emailTo: ""
+    pagerdutyKey: ""
+    existingSecret: ""
+
+  nodeSelector: {}
+  tolerations: {}
+
+# ---------------------------------------------------------------------------
+# Alertmanager
+# ---------------------------------------------------------------------------
+alertmanager:
+  enabled: true
+  image:
+    repository: prom/alertmanager
+    tag: "v0.27.0"
+  persistence:
+    enabled: true
+    size: 1Gi
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
+  config:
+    slackWebhook: ""
+    emailTo: ""
+    pagerdutyKey: ""
+    existingSecret: ""
+
+# ---------------------------------------------------------------------------
+# Host metrics
+# ---------------------------------------------------------------------------
+nodeExporter:
+  enabled: true
+  image:
+    repository: prom/node-exporter
+    tag: "v1.8.2"
+  tolerations:
+    - operator: Exists   # needs to run on every node
+
+# ---------------------------------------------------------------------------
+# The dashboards and rules themselves are shipped in the chart, not fetched.
+# ---------------------------------------------------------------------------
+dashboards:
+  create: true
+  # Dashboards render into a folder of this name in Grafana.
+  folder: "AI Agent Observability"
+
+serviceMonitor:
+  # Requires the Prometheus Operator. Off by default so the chart installs on a
+  # bare cluster without CRDs.
+  enabled: false
+  interval: 15s
+  additionalLabels: {}

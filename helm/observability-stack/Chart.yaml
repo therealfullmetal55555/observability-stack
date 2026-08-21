@@ -1,0 +1,28 @@
+apiVersion: v2
+name: observability-stack
+description: OpenTelemetry + Grafana stack tuned for AI agents — token cost, tool latency, citation coverage
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.25.0-0"
+
+keywords:
+  - opentelemetry
+  - observability
+  - ai-agents
+  - llm
+  - grafana
+  - tempo
+  - prometheus
+
+home: https://github.com/therealfullmetal55555/observability-stack
+sources:
+  - https://github.com/therealfullmetal55555/observability-stack
+
+maintainers:
+  - name: therealfullmetal55555
+    url: https://github.com/therealfullmetal55555
+
+annotations:
+  category: Monitoring
+  licenses: MIT

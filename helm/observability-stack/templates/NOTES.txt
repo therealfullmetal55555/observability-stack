@@ -1,0 +1,54 @@
+{{ .Chart.Name }} {{ .Chart.Version }} is installed in namespace {{ .Release.Namespace }}.
+
+Agents send telemetry here
+--------------------------
+    in-cluster:  {{ include "observability.fullname" . }}-collector.{{ .Release.Namespace }}:{{ .Values.collector.service.grpcPort }}
+    in-cluster:  {{ include "observability.fullname" . }}-collector.{{ .Release.Namespace }}:{{ .Values.collector.service.httpPort }}
+
+    export OTEL_EXPORTER_OTLP_ENDPOINT=http://{{ include "observability.fullname" . }}-collector.{{ .Release.Namespace }}:{{ .Values.collector.service.grpcPort }}
+    export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+
+Grafana
+-------
+{{- if .Values.grafana.ingress.enabled }}
+    https://{{ (first .Values.grafana.ingress.hosts).host }}
+{{- else }}
+    kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "observability.fullname" . }}-grafana 3000:3000
+    then open http://localhost:3000
+{{- end }}
+    user: {{ .Values.grafana.admin.user }}
+{{- if .Values.grafana.admin.existingSecret }}
+    password: from secret {{ .Values.grafana.admin.existingSecret }} (key: admin-password)
+{{- else }}
+    password: the value of grafana.admin.password — change it, or set grafana.admin.existingSecret
+{{- end }}
+
+    Five dashboards land in the "{{ .Values.dashboards.folder }}" folder.
+
+Give it something to show
+-------------------------
+    kubectl run traffic --rm -it --restart=Never --image=python:3.12 \
+      --env OTEL_EXPORTER_OTLP_ENDPOINT=http://{{ include "observability.fullname" . }}-collector:{{ .Values.collector.service.httpPort }} \
+      -- python -c "$(curl -fsSL https://raw.githubusercontent.com/therealfullmetal55555/observability-stack/main/tests/load/generate_traffic.py)"
+{{- if not .Values.collector.customBinary }}
+
+A note on cost
+--------------
+    collector.customBinary is false, so the tokencost processor is NOT in the
+    pipeline. Agents still report their own cost, but the central price table is
+    inactive and no cost is filled in for them.
+
+    To enable it:
+      docker build -f docker/Dockerfile.collector -t <registry>/otelcol-ai:{{ .Chart.AppVersion }} .
+      docker push <registry>/otelcol-ai:{{ .Chart.AppVersion }}
+      helm upgrade {{ .Release.Name }} . -n {{ .Release.Namespace }} \
+        --set collector.customBinary=true \
+        --set collector.image.repository=<registry>/otelcol-ai \
+        --set collector.image.tag={{ .Chart.AppVersion }}
+{{- end }}
+{{- if not .Values.serviceMonitor.enabled }}
+
+    serviceMonitor.enabled is false, so the collector's own metrics are only
+    scraped by the in-chart Prometheus. Set it to true if you run the
+    Prometheus Operator.
+{{- end }}

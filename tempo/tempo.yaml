@@ -1,0 +1,29 @@
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  max_block_duration: 1h
+  trace_idle_period: 30s
+  max_block_duration: 1h
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo
+
+limits:
+  ingestion_rate_limit: 50000
+  ingestion_burst_size: 20000
+  max_bytes_per_trace: 1048576
+  max_tag_value_length: 256
